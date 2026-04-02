@@ -591,28 +591,50 @@ class NaimPlayer(MediaPlayerEntity):
             f"playing state to {self._state.playing_state} for {self._name}"
         )
 
-    async def async_mute_volume(self, mute):
-        """Mute the volume."""
-        _LOGGER.info("Setting mute to %s for %s (current state: %s)", mute, self._name, self._state.muted)
+    async def async_mute_volume(self, mute: bool):
+        """Toggle mute by reading the device's actual state and flipping it.
+
+        The mute parameter from HA is ignored because HA's state can be
+        out of sync with the device (e.g. if mute was changed via the
+        physical remote or the Naim app). Instead, we always query the
+        device directly and flip whatever state it reports.
+        """
+        _LOGGER.info("Toggling mute for %s", self._name)
         try:
             # Record user action timestamp for debounce
             self._last_user_mute_action = time.time()
 
-            # Immediately update the local state for responsive UI
+            # Query the device's actual mute state
+            current = await self.async_get_current_value("http://{ip}:15081/levels/room", "mute")
+            if current is None:
+                _LOGGER.warning("Could not read current mute state; aborting toggle.")
+                return
+
+            # Flip the actual device state
+            new_muted = not bool(int(current))
+            mute_value = int(new_muted)
+
+            # Update local state immediately for responsive UI
             old_muted = self._state.muted
-            await self._state.update(muted=bool(mute))
-            _LOGGER.info("Updated local mute state to %s", self._state.muted)
+            await self._state.update(muted=new_muted)
             self.async_write_ha_state()
 
-            # Then send the command to the device
-            mute_value = int(bool(mute))
-            await async_get_clientsession(self._hass).put(
-                f"http://{self._ip_address}:15081/levels/room?mute={mute_value}"
-            )
-            _LOGGER.debug("Successfully sent mute command %s to device", mute_value)
+            # Send command to device (try PUT first, fall back to GET)
+            session = async_get_clientsession(self._hass)
+            url = f"http://{self._ip_address}:15081/levels/room?mute={mute_value}"
+            resp = await session.put(url)
+            if not (200 <= resp.status < 300):
+                resp = await session.get(url)
+                if not (200 <= resp.status < 300):
+                    _LOGGER.error("Mute toggle failed (PUT and GET both non-2xx).")
+                    await self._state.update(muted=old_muted)
+                    self.async_write_ha_state()
+                    return
+
+            _LOGGER.debug("Mute toggled; now muted=%s", new_muted)
+
         except aiohttp.ClientError as error:
-            _LOGGER.error("Error setting mute for %s: %s", self._name, error)
-            # Revert the state if the command failed
+            _LOGGER.error("Error toggling mute for %s: %s", self._name, error)
             await self._state.update(muted=old_muted)
             self.async_write_ha_state()
 
